@@ -26,7 +26,7 @@ from numpy.typing import NDArray
 @dataclass
 class SymOp:
     """
-    A symmetry operation defined by a 3x3 rotation matrix and a translation vector.
+    A symmetry operation defined by a rotation matrix and translation vector.
 
     The symmetry operation transforms fractional coordinates as:
         x' = rot @ x + tr
@@ -122,7 +122,7 @@ class SymOp:
 
 
 def _float_to_fraction_str(val: float) -> str:
-    """Convert a float to a fraction string if it matches common crystallographic fractions."""
+    """Convert float to fraction string for common crystallographic fractions."""
     fractions = {
         1 / 2: "+1/2",
         1 / 3: "+1/3",
@@ -346,10 +346,11 @@ class Crystal:
         # Fractional to Cartesian matrix (column vectors are lattice vectors)
         # Using the standard crystallographic convention:
         # a along x, b in xy plane, c general
+        c_y = self.c * (cos_alpha - cos_beta * cos_gamma) / sin_gamma
         self._frac_to_cart = np.array(
             [
                 [self.a, self.b * cos_gamma, self.c * cos_beta],
-                [0.0, self.b * sin_gamma, self.c * (cos_alpha - cos_beta * cos_gamma) / sin_gamma],
+                [0.0, self.b * sin_gamma, c_y],
                 [0.0, 0.0, self.c * omega / sin_gamma],
             ]
         )
@@ -879,6 +880,675 @@ def get_crystal_info(filepath: str | Path) -> dict:
     }
 
 
+def generate_spherical_cluster(
+    filepath: str | Path,
+    radius: float,
+    center: Optional[NDArray[np.float64]] = None,
+    remove_duplicates: bool = True,
+    duplicate_tolerance: float = 0.01,
+) -> Tuple[qcel.models.Molecule, Crystal, List[Tuple[int, int, int]]]:
+    """
+    Generate an approximately spherical cluster of molecules from a CIF file.
+
+    This function creates a supercell that extends far enough in all directions
+    to include all unit cells whose centers fall within the specified radius
+    from a central reference point. The result is an approximately spherical
+    cluster of molecules.
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Path to the CIF file.
+    radius : float
+        Radius in Angstroms from the center point. Unit cells with any atom
+        within this radius from the center will be included.
+    center : NDArray[np.float64], optional
+        Center point in fractional coordinates. Defaults to (0.5, 0.5, 0.5),
+        the center of the reference unit cell.
+    remove_duplicates : bool, default=True
+        If True, remove duplicate atoms at unit cell boundaries.
+    duplicate_tolerance : float, default=0.01
+        Distance tolerance (in Angstroms) for detecting duplicates.
+
+    Returns
+    -------
+    Tuple[qcel.models.Molecule, Crystal, List[Tuple[int, int, int]]]
+        - QCElemental Molecule object with all atoms in the cluster
+        - Crystal object with unit cell information
+        - List of (i, j, k) unit cell indices included in the cluster
+
+    Examples
+    --------
+    >>> mol, crystal, cells = generate_spherical_cluster("structure.cif", 15.0)
+    >>> print(f"Cluster contains {len(mol.symbols)} atoms")
+    >>> print(f"From {len(cells)} unit cells")
+    """
+    crystal, asu_symbols, asu_frac_coords = parse_cif_file(filepath)
+
+    if center is None:
+        center = np.array([0.5, 0.5, 0.5])
+    else:
+        center = np.asarray(center)
+
+    # First, generate the full unit cell (symmetry-expanded)
+    unit_cell_symbols = []
+    unit_cell_frac_coords = []
+
+    for symbol, frac_coord in zip(asu_symbols, asu_frac_coords):
+        equiv_coords = crystal.generate_symmetry_equivalents(
+            frac_coord, wrap_to_unit_cell=True
+        )
+        for coord in equiv_coords:
+            unit_cell_symbols.append(symbol)
+            unit_cell_frac_coords.append(coord)
+
+    unit_cell_frac_coords = np.array(unit_cell_frac_coords)
+
+    # Remove duplicates within the unit cell
+    if remove_duplicates:
+        unit_cell_symbols, unit_cell_frac_coords = remove_duplicate_atoms(
+            unit_cell_symbols, unit_cell_frac_coords, tolerance=0.01
+        )
+
+    # Calculate how many unit cells we need in each direction
+    # Use the lattice vectors to estimate the range
+    center_cart = crystal.to_cartesian(center)
+
+    # Calculate the maximum number of cells needed in each direction
+    # by considering the lattice parameters
+    n_a = int(np.ceil(radius / crystal.a)) + 1
+    n_b = int(np.ceil(radius / crystal.b)) + 1
+    n_c = int(np.ceil(radius / crystal.c)) + 1
+
+    # Collect all atoms within the spherical region
+    all_symbols = []
+    all_cart_coords = []
+    included_cells = []
+
+    # Iterate over all potentially relevant unit cells
+    for i in range(-n_a, n_a + 1):
+        for j in range(-n_b, n_b + 1):
+            for k in range(-n_c, n_c + 1):
+                # Translation vector for this unit cell
+                translation = np.array([float(i), float(j), float(k)])
+
+                # Check if any atom from this cell is within radius
+                cell_atoms_in_range = False
+                cell_symbols = []
+                cell_coords = []
+
+                for sym, frac in zip(
+                    unit_cell_symbols, unit_cell_frac_coords
+                ):
+                    # Translate fractional coordinates
+                    translated_frac = frac + translation
+
+                    # Convert to Cartesian
+                    cart = crystal.to_cartesian(translated_frac)
+
+                    # Check distance from center
+                    dist = np.linalg.norm(cart - center_cart)
+
+                    if dist <= radius:
+                        cell_atoms_in_range = True
+                        cell_symbols.append(sym)
+                        cell_coords.append(cart)
+
+                # If any atom is in range, include all atoms from this cell
+                # that are within the radius
+                if cell_atoms_in_range:
+                    all_symbols.extend(cell_symbols)
+                    all_cart_coords.extend(cell_coords)
+                    if (i, j, k) not in included_cells:
+                        included_cells.append((i, j, k))
+
+    all_cart_coords = np.array(all_cart_coords)
+
+    # Remove duplicate atoms at boundaries (in Cartesian space)
+    if remove_duplicates and len(all_symbols) > 0:
+        all_symbols, all_cart_coords = _remove_duplicate_atoms_cartesian(
+            all_symbols, all_cart_coords, tolerance=duplicate_tolerance
+        )
+
+    # Convert Angstroms to Bohr for QCElemental
+    cart_coords_bohr = all_cart_coords / qcel.constants.bohr2angstroms
+
+    # Create QCElemental Molecule
+    mol = qcel.models.Molecule(
+        symbols=all_symbols,
+        geometry=cart_coords_bohr.flatten(),
+    )
+
+    return mol, crystal, included_cells
+
+
+def _remove_duplicate_atoms_cartesian(
+    symbols: List[str],
+    coords: NDArray[np.float64],
+    tolerance: float = 0.01,
+) -> Tuple[List[str], NDArray[np.float64]]:
+    """
+    Remove duplicate atoms based on Cartesian coordinate proximity.
+
+    Parameters
+    ----------
+    symbols : List[str]
+        List of atom symbols.
+    coords : NDArray[np.float64]
+        Cartesian coordinates array of shape (N, 3).
+    tolerance : float
+        Distance tolerance in Angstroms for considering atoms as duplicates.
+
+    Returns
+    -------
+    Tuple[List[str], NDArray[np.float64]]
+        Unique atom symbols and coordinates.
+    """
+    if len(symbols) == 0:
+        return symbols, coords
+
+    unique_symbols = [symbols[0]]
+    unique_coords = [coords[0]]
+
+    for i in range(1, len(symbols)):
+        is_duplicate = False
+        for j in range(len(unique_coords)):
+            dist = np.linalg.norm(coords[i] - unique_coords[j])
+            if dist < tolerance:
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
+            unique_symbols.append(symbols[i])
+            unique_coords.append(coords[i])
+
+    return unique_symbols, np.array(unique_coords)
+
+
+def generate_supercell(
+    filepath: str | Path,
+    na: int = 1,
+    nb: int = 1,
+    nc: int = 1,
+    remove_duplicates: bool = True,
+    duplicate_tolerance: float = 0.01,
+) -> qcel.models.Molecule:
+    """
+    Generate a supercell by replicating the unit cell.
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Path to the CIF file.
+    na, nb, nc : int
+        Number of unit cell replications along a, b, c axes.
+        Use negative values to extend in both directions (e.g., na=-2
+        creates cells from -2 to +2 along a).
+    remove_duplicates : bool, default=True
+        If True, remove duplicate atoms at unit cell boundaries.
+    duplicate_tolerance : float, default=0.01
+        Distance tolerance (in Angstroms) for detecting duplicates.
+
+    Returns
+    -------
+    qcel.models.Molecule
+        QCElemental Molecule object with the supercell.
+
+    Examples
+    --------
+    >>> mol = generate_supercell("structure.cif", na=2, nb=2, nc=2)
+    >>> # Creates a 2x2x2 supercell (8 unit cells)
+    """
+    crystal, asu_symbols, asu_frac_coords = parse_cif_file(filepath)
+
+    # Generate full unit cell
+    unit_cell_symbols = []
+    unit_cell_frac_coords = []
+
+    for symbol, frac_coord in zip(asu_symbols, asu_frac_coords):
+        equiv_coords = crystal.generate_symmetry_equivalents(
+            frac_coord, wrap_to_unit_cell=True
+        )
+        for coord in equiv_coords:
+            unit_cell_symbols.append(symbol)
+            unit_cell_frac_coords.append(coord)
+
+    unit_cell_frac_coords = np.array(unit_cell_frac_coords)
+
+    if remove_duplicates:
+        unit_cell_symbols, unit_cell_frac_coords = remove_duplicate_atoms(
+            unit_cell_symbols, unit_cell_frac_coords, tolerance=0.01
+        )
+
+    # Determine range for each axis
+    def get_range(n):
+        if n < 0:
+            return range(n, -n + 1)
+        return range(n)
+
+    range_a = get_range(na)
+    range_b = get_range(nb)
+    range_c = get_range(nc)
+
+    # Generate supercell
+    all_symbols = []
+    all_cart_coords = []
+
+    for i in range_a:
+        for j in range_b:
+            for k in range_c:
+                translation = np.array([float(i), float(j), float(k)])
+
+                for sym, frac in zip(
+                    unit_cell_symbols, unit_cell_frac_coords
+                ):
+                    translated_frac = frac + translation
+                    cart = crystal.to_cartesian(translated_frac)
+                    all_symbols.append(sym)
+                    all_cart_coords.append(cart)
+
+    all_cart_coords = np.array(all_cart_coords)
+
+    if remove_duplicates and len(all_symbols) > 0:
+        all_symbols, all_cart_coords = _remove_duplicate_atoms_cartesian(
+            all_symbols, all_cart_coords, tolerance=duplicate_tolerance
+        )
+
+    # Convert to Bohr
+    cart_coords_bohr = all_cart_coords / qcel.constants.bohr2angstroms
+
+    mol = qcel.models.Molecule(
+        symbols=all_symbols,
+        geometry=cart_coords_bohr.flatten(),
+    )
+
+    return mol
+
+
+@dataclass
+class Monomer:
+    """
+    Represents a molecular monomer in the crystal.
+
+    Attributes
+    ----------
+    symbols : List[str]
+        Atom symbols in the monomer.
+    frac_coords : NDArray[np.float64]
+        Fractional coordinates of atoms, shape (N, 3).
+    cart_coords : NDArray[np.float64]
+        Cartesian coordinates of atoms, shape (N, 3).
+    cell_index : Tuple[int, int, int]
+        Unit cell index (i, j, k) where this monomer is located.
+    symop_index : int
+        Index of the symmetry operation that generated this monomer.
+    centroid_frac : NDArray[np.float64]
+        Centroid in fractional coordinates.
+    centroid_cart : NDArray[np.float64]
+        Centroid in Cartesian coordinates (Angstroms).
+    """
+
+    symbols: List[str]
+    frac_coords: NDArray[np.float64]
+    cart_coords: NDArray[np.float64]
+    cell_index: Tuple[int, int, int]
+    symop_index: int
+    centroid_frac: NDArray[np.float64]
+    centroid_cart: NDArray[np.float64]
+
+    def to_molecule(self) -> qcel.models.Molecule:
+        """Convert to QCElemental Molecule object."""
+        cart_bohr = self.cart_coords / qcel.constants.bohr2angstroms
+        return qcel.models.Molecule(
+            symbols=self.symbols,
+            geometry=cart_bohr.flatten(),
+        )
+
+
+@dataclass
+class DimerPair:
+    """
+    Represents a unique dimer pairing between two monomers.
+
+    Attributes
+    ----------
+    monomer_a : Monomer
+        The reference monomer (always from the central unit cell).
+    monomer_b : Monomer
+        The partner monomer.
+    distance : float
+        Center-to-center distance in Angstroms.
+    symop_index_a : int
+        Symmetry operation index for monomer A.
+    symop_index_b : int
+        Symmetry operation index for monomer B.
+    cell_index_b : Tuple[int, int, int]
+        Unit cell index of monomer B relative to A.
+    multiplicity : int
+        Number of symmetry-equivalent copies of this dimer type.
+    """
+
+    monomer_a: Monomer
+    monomer_b: Monomer
+    distance: float
+    symop_index_a: int
+    symop_index_b: int
+    cell_index_b: Tuple[int, int, int]
+    multiplicity: int = 1
+
+    def to_molecule(self) -> qcel.models.Molecule:
+        """Convert dimer to QCElemental Molecule object."""
+        symbols = list(self.monomer_a.symbols) + list(self.monomer_b.symbols)
+        coords_a = self.monomer_a.cart_coords
+        coords_b = self.monomer_b.cart_coords
+        coords = np.vstack([coords_a, coords_b])
+        cart_bohr = coords / qcel.constants.bohr2angstroms
+        return qcel.models.Molecule(
+            symbols=symbols,
+            geometry=cart_bohr.flatten(),
+        )
+
+
+def generate_unique_dimers(
+    filepath: str | Path,
+    radius: float,
+    reference_symop: int = 0,
+    distance_tolerance: float = 0.01,
+) -> Tuple[List[DimerPair], Crystal, Monomer]:
+    """
+    Generate symmetry-unique dimer pairings within a spherical radius.
+
+    This function identifies all unique molecular dimers by considering
+    space group symmetry. For each unique dimer type, only one
+    representative is returned along with its multiplicity.
+
+    The reference monomer is always the molecule generated by the
+    specified symmetry operation in the central unit cell (0, 0, 0).
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Path to the CIF file.
+    radius : float
+        Maximum center-to-center distance in Angstroms for dimer pairs.
+    reference_symop : int, default=0
+        Index of the symmetry operation to use for the reference monomer.
+        Default is 0 (identity operation).
+    distance_tolerance : float, default=0.01
+        Tolerance in Angstroms for considering distances as equivalent.
+
+    Returns
+    -------
+    Tuple[List[DimerPair], Crystal, Monomer]
+        - List of unique DimerPair objects, sorted by distance
+        - Crystal object with unit cell information
+        - The reference Monomer object
+
+    Examples
+    --------
+    >>> dimers, crystal, ref_mol = generate_unique_dimers("co2.cif", 10.0)
+    >>> for d in dimers:
+    ...     print(f"Distance: {d.distance:.2f} A, mult: {d.multiplicity}")
+
+    Notes
+    -----
+    Two dimers are considered symmetry-equivalent if they have:
+    1. The same center-to-center distance (within tolerance)
+    2. The same relative symmetry operation relationship
+
+    The multiplicity counts how many times each unique dimer type
+    appears when considering all symmetry operations applied to the
+    reference monomer.
+    """
+    crystal, asu_symbols, asu_frac_coords = parse_cif_file(filepath)
+
+    # Generate all monomers in the central unit cell
+    # Each monomer corresponds to one symmetry operation applied to the ASU
+    central_monomers = []
+    for symop_idx, symop in enumerate(crystal.symops):
+        mon_symbols = []
+        mon_frac = []
+        for sym, frac in zip(asu_symbols, asu_frac_coords):
+            new_frac = symop.apply(frac)
+            new_frac = new_frac % 1.0  # Wrap to unit cell
+            mon_symbols.append(sym)
+            mon_frac.append(new_frac)
+
+        mon_frac = np.array(mon_frac)
+        mon_cart = crystal.to_cartesian(mon_frac)
+        centroid_frac = np.mean(mon_frac, axis=0)
+        centroid_cart = np.mean(mon_cart, axis=0)
+
+        monomer = Monomer(
+            symbols=mon_symbols,
+            frac_coords=mon_frac,
+            cart_coords=mon_cart,
+            cell_index=(0, 0, 0),
+            symop_index=symop_idx,
+            centroid_frac=centroid_frac,
+            centroid_cart=centroid_cart,
+        )
+        central_monomers.append(monomer)
+
+    # Remove duplicate monomers (from special positions)
+    unique_central = _remove_duplicate_monomers(
+        central_monomers, tolerance=0.01
+    )
+
+    # The reference monomer
+    ref_monomer = None
+    for mon in unique_central:
+        if mon.symop_index == reference_symop:
+            ref_monomer = mon
+            break
+    if ref_monomer is None:
+        ref_monomer = unique_central[0]
+
+    ref_centroid = ref_monomer.centroid_cart
+
+    # Calculate range of unit cells to search
+    n_a = int(np.ceil(radius / crystal.a)) + 1
+    n_b = int(np.ceil(radius / crystal.b)) + 1
+    n_c = int(np.ceil(radius / crystal.c)) + 1
+
+    # Generate all candidate dimers
+    candidate_dimers = []
+
+    for i in range(-n_a, n_a + 1):
+        for j in range(-n_b, n_b + 1):
+            for k in range(-n_c, n_c + 1):
+                cell_idx = (i, j, k)
+                translation = np.array([float(i), float(j), float(k)])
+
+                for base_mon in unique_central:
+                    # Skip self-pairing in central cell
+                    if cell_idx == (0, 0, 0):
+                        if base_mon.symop_index == ref_monomer.symop_index:
+                            continue
+
+                    # Translate monomer to this cell
+                    trans_frac = base_mon.frac_coords + translation
+                    trans_cart = crystal.to_cartesian(trans_frac)
+                    trans_centroid = np.mean(trans_cart, axis=0)
+
+                    # Check distance
+                    dist = np.linalg.norm(trans_centroid - ref_centroid)
+                    if dist > radius:
+                        continue
+
+                    partner = Monomer(
+                        symbols=base_mon.symbols,
+                        frac_coords=trans_frac,
+                        cart_coords=trans_cart,
+                        cell_index=cell_idx,
+                        symop_index=base_mon.symop_index,
+                        centroid_frac=np.mean(trans_frac, axis=0),
+                        centroid_cart=trans_centroid,
+                    )
+
+                    dimer = DimerPair(
+                        monomer_a=ref_monomer,
+                        monomer_b=partner,
+                        distance=dist,
+                        symop_index_a=ref_monomer.symop_index,
+                        symop_index_b=base_mon.symop_index,
+                        cell_index_b=cell_idx,
+                        multiplicity=1,
+                    )
+                    candidate_dimers.append(dimer)
+
+    # Identify unique dimers based on distance and symmetry relationship
+    unique_dimers = _identify_unique_dimers(
+        candidate_dimers,
+        crystal,
+        distance_tolerance,
+    )
+
+    # Sort by distance
+    unique_dimers.sort(key=lambda d: d.distance)
+
+    return unique_dimers, crystal, ref_monomer
+
+
+def _remove_duplicate_monomers(
+    monomers: List[Monomer],
+    tolerance: float = 0.01,
+) -> List[Monomer]:
+    """Remove duplicate monomers based on centroid proximity."""
+    if not monomers:
+        return monomers
+
+    unique = [monomers[0]]
+    for mon in monomers[1:]:
+        is_dup = False
+        for u in unique:
+            dist = np.linalg.norm(mon.centroid_cart - u.centroid_cart)
+            if dist < tolerance:
+                is_dup = True
+                break
+        if not is_dup:
+            unique.append(mon)
+    return unique
+
+
+def _identify_unique_dimers(
+    dimers: List[DimerPair],
+    crystal: Crystal,
+    tolerance: float = 0.01,
+) -> List[DimerPair]:
+    """
+    Identify symmetry-unique dimers from a list of candidates.
+
+    Two dimers are equivalent if:
+    1. They have the same distance (within tolerance)
+    2. They represent the same symmetry relationship
+
+    Returns unique dimers with multiplicity set.
+    """
+    if not dimers:
+        return []
+
+    # Group by distance first
+    dimers_sorted = sorted(dimers, key=lambda d: d.distance)
+
+    unique = []
+    used = [False] * len(dimers_sorted)
+
+    for i, dimer_i in enumerate(dimers_sorted):
+        if used[i]:
+            continue
+
+        # This is a new unique dimer
+        multiplicity = 1
+        used[i] = True
+
+        # Find equivalent dimers
+        for j in range(i + 1, len(dimers_sorted)):
+            if used[j]:
+                continue
+
+            dimer_j = dimers_sorted[j]
+
+            # Check if distances match
+            if abs(dimer_i.distance - dimer_j.distance) > tolerance:
+                # Since sorted, no more matches possible at this distance
+                if dimer_j.distance > dimer_i.distance + tolerance:
+                    break
+                continue
+
+            # Check if symmetry relationship is equivalent
+            if _are_dimers_equivalent(dimer_i, dimer_j, crystal, tolerance):
+                multiplicity += 1
+                used[j] = True
+
+        # Create unique dimer with multiplicity
+        unique_dimer = DimerPair(
+            monomer_a=dimer_i.monomer_a,
+            monomer_b=dimer_i.monomer_b,
+            distance=dimer_i.distance,
+            symop_index_a=dimer_i.symop_index_a,
+            symop_index_b=dimer_i.symop_index_b,
+            cell_index_b=dimer_i.cell_index_b,
+            multiplicity=multiplicity,
+        )
+        unique.append(unique_dimer)
+
+    return unique
+
+
+def _are_dimers_equivalent(
+    dimer1: DimerPair,
+    dimer2: DimerPair,
+    crystal: Crystal,
+    tolerance: float = 0.01,
+) -> bool:
+    """
+    Check if two dimers are symmetry-equivalent.
+
+    Two dimers are equivalent if they have the same relative geometry,
+    meaning one can be transformed into the other by a space group
+    symmetry operation.
+    """
+    # Same distance is a prerequisite (already checked by caller)
+    if abs(dimer1.distance - dimer2.distance) > tolerance:
+        return False
+
+    # Check if the symop relationships are the same
+    # This is a simplification: same symop_b index and same relative
+    # cell translation pattern indicates equivalence
+    if dimer1.symop_index_b == dimer2.symop_index_b:
+        # Check if cell translations differ only by a lattice vector
+        # that would make them equivalent under translation
+        cell1 = np.array(dimer1.cell_index_b)
+        cell2 = np.array(dimer2.cell_index_b)
+
+        # They're equivalent if the cell index difference is the same
+        # (accounting for inversion symmetry)
+        if np.allclose(cell1, cell2):
+            return True
+        if np.allclose(cell1, -cell2):
+            return True
+
+    # More sophisticated check: compare actual geometry
+    # Get relative vectors between centroids
+    vec1 = dimer1.monomer_b.centroid_cart - dimer1.monomer_a.centroid_cart
+    vec2 = dimer2.monomer_b.centroid_cart - dimer2.monomer_a.centroid_cart
+
+    # Check if vectors are related by a point group operation
+    # (rotation or reflection that preserves the lattice)
+    for symop in crystal.symops:
+        # Apply rotation part only (not translation)
+        rot_vec = crystal.to_cartesian(
+            symop.rot @ crystal.to_fractional(vec1)
+        )
+        if np.allclose(rot_vec, vec2, atol=tolerance):
+            return True
+        if np.allclose(rot_vec, -vec2, atol=tolerance):
+            return True
+
+    return False
+
+
 if __name__ == "__main__":
     # Example usage / test
     import sys
@@ -887,7 +1557,15 @@ if __name__ == "__main__":
         cif_path = sys.argv[1]
     else:
         # Default test file
-        cif_path = "/home/awallace43/projects/x23_dmetcalf_2022_si/cifs/carbon_dioxide.cif"
+        cif_path = (
+            "/home/awallace43/projects/x23_dmetcalf_2022_si/cifs/"
+            "carbon_dioxide.cif"
+        )
+
+    # Parse optional radius argument
+    radius = None
+    if len(sys.argv) > 2:
+        radius = float(sys.argv[2])
 
     print(f"Processing CIF file: {cif_path}")
     print("-" * 60)
@@ -895,23 +1573,49 @@ if __name__ == "__main__":
     # Get crystal info
     info = get_crystal_info(cif_path)
     print("Crystal Information:")
-    print(f"  Lattice parameters: a={info['a']:.3f}, b={info['b']:.3f}, c={info['c']:.3f}")
-    print(f"  Lattice angles: alpha={info['alpha']:.1f}, beta={info['beta']:.1f}, gamma={info['gamma']:.1f}")
+    print(
+        f"  Lattice parameters: a={info['a']:.3f}, "
+        f"b={info['b']:.3f}, c={info['c']:.3f}"
+    )
+    print(
+        f"  Lattice angles: alpha={info['alpha']:.1f}, "
+        f"beta={info['beta']:.1f}, gamma={info['gamma']:.1f}"
+    )
     print(f"  Volume: {info['volume']:.3f} A^3")
-    print(f"  Space group: {info['space_group_name']} (#{info['space_group_number']})")
+    sg_name = info['space_group_name']
+    sg_num = info['space_group_number']
+    print(f"  Space group: {sg_name} (#{sg_num})")
     print(f"  Symmetry operations: {info['n_symops']}")
     print(f"  Atoms in ASU: {info['n_atoms_asu']}")
     print("-" * 60)
 
-    # Create molecule
-    mol = cif_to_molecule(cif_path)
-    print(f"\nQCElemental Molecule:")
-    print(f"  Number of atoms: {len(mol.symbols)}")
-    print(f"  Symbols: {list(mol.symbols)}")
-    print(f"  Molecular formula: {mol.get_molecular_formula()}")
+    if radius is not None:
+        # Generate spherical cluster
+        print(f"\nGenerating spherical cluster with radius {radius} A...")
+        mol, crystal, cells = generate_spherical_cluster(cif_path, radius)
+        print(f"  Number of unit cells: {len(cells)}")
+        print(f"  Number of atoms: {len(mol.symbols)}")
+        print(f"  Molecular formula: {mol.get_molecular_formula()}")
 
-    # Print coordinates
-    coords_angstrom = mol.geometry.reshape(-1, 3) * qcel.constants.bohr2angstroms
-    print("\n  Cartesian coordinates (Angstroms):")
-    for i, (sym, coord) in enumerate(zip(mol.symbols, coords_angstrom)):
-        print(f"    {sym:2s}  {coord[0]:10.6f}  {coord[1]:10.6f}  {coord[2]:10.6f}")
+        # Calculate actual extent
+        coords = mol.geometry.reshape(-1, 3) * qcel.constants.bohr2angstroms
+        center = np.mean(coords, axis=0)
+        distances = np.linalg.norm(coords - center, axis=1)
+        print(f"  Max distance from center: {np.max(distances):.2f} A")
+        print(f"  Unit cells included: {cells[:10]}...")
+    else:
+        # Create single unit cell molecule
+        mol = cif_to_molecule(cif_path)
+        print("\nQCElemental Molecule (single unit cell):")
+        print(f"  Number of atoms: {len(mol.symbols)}")
+        print(f"  Symbols: {list(mol.symbols)}")
+        print(f"  Molecular formula: {mol.get_molecular_formula()}")
+
+        # Print coordinates
+        coords = mol.geometry.reshape(-1, 3) * qcel.constants.bohr2angstroms
+        print("\n  Cartesian coordinates (Angstroms):")
+        for sym, coord in zip(mol.symbols, coords):
+            print(
+                f"    {sym:2s}  {coord[0]:10.6f}  "
+                f"{coord[1]:10.6f}  {coord[2]:10.6f}"
+            )

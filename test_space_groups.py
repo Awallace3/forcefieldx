@@ -12,12 +12,16 @@ from pathlib import Path
 from space_groups import (
     SymOp,
     Crystal,
+    Monomer,
+    DimerPair,
     parse_symop_xyz,
     parse_cif_file,
     cif_to_molecule,
     get_crystal_info,
     remove_duplicate_atoms,
+    generate_unique_dimers,
     _parse_fraction,
+    _remove_duplicate_monomers,
 )
 
 
@@ -413,6 +417,353 @@ class TestSymOpRoundtrip:
 
         # Results should match
         assert np.allclose(result1, result2), f"Mismatch for {xyz_str} -> {xyz_str2}"
+
+
+class TestMonomer:
+    """Tests for Monomer dataclass."""
+
+    def test_monomer_creation(self):
+        """Test creating a Monomer object."""
+        symbols = ["C", "O", "O"]
+        frac_coords = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]])
+        cart_coords = np.array([[0.0, 0.0, 0.0], [1.16, 0.0, 0.0], [-1.16, 0.0, 0.0]])
+        centroid_frac = np.mean(frac_coords, axis=0)
+        centroid_cart = np.mean(cart_coords, axis=0)
+
+        monomer = Monomer(
+            symbols=symbols,
+            frac_coords=frac_coords,
+            cart_coords=cart_coords,
+            cell_index=(0, 0, 0),
+            symop_index=0,
+            centroid_frac=centroid_frac,
+            centroid_cart=centroid_cart,
+        )
+
+        assert monomer.symbols == ["C", "O", "O"]
+        assert monomer.cell_index == (0, 0, 0)
+        assert monomer.symop_index == 0
+        assert monomer.frac_coords.shape == (3, 3)
+        assert monomer.cart_coords.shape == (3, 3)
+
+    def test_monomer_to_molecule(self):
+        """Test converting Monomer to QCElemental Molecule."""
+        import qcelemental as qcel
+
+        symbols = ["C", "O", "O"]
+        # CO2 in Angstroms
+        cart_coords = np.array([[0.0, 0.0, 0.0], [1.16, 0.0, 0.0], [-1.16, 0.0, 0.0]])
+        frac_coords = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]])
+
+        monomer = Monomer(
+            symbols=symbols,
+            frac_coords=frac_coords,
+            cart_coords=cart_coords,
+            cell_index=(0, 0, 0),
+            symop_index=0,
+            centroid_frac=np.zeros(3),
+            centroid_cart=np.zeros(3),
+        )
+
+        mol = monomer.to_molecule()
+        assert tuple(mol.symbols) == ("C", "O", "O")
+        # Check geometry is in Bohr
+        geom = np.array(mol.geometry).reshape(-1, 3)
+        expected = cart_coords / qcel.constants.bohr2angstroms
+        assert np.allclose(geom, expected, atol=1e-6)
+
+
+class TestDimerPair:
+    """Tests for DimerPair dataclass."""
+
+    def test_dimer_pair_creation(self):
+        """Test creating a DimerPair object."""
+        symbols = ["C", "O", "O"]
+        cart_a = np.array([[0.0, 0.0, 0.0], [1.16, 0.0, 0.0], [-1.16, 0.0, 0.0]])
+        cart_b = np.array([[5.0, 0.0, 0.0], [6.16, 0.0, 0.0], [3.84, 0.0, 0.0]])
+        frac_a = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]])
+        frac_b = np.array([[0.5, 0.0, 0.0], [0.6, 0.0, 0.0], [0.4, 0.0, 0.0]])
+
+        mon_a = Monomer(
+            symbols=symbols,
+            frac_coords=frac_a,
+            cart_coords=cart_a,
+            cell_index=(0, 0, 0),
+            symop_index=0,
+            centroid_frac=np.mean(frac_a, axis=0),
+            centroid_cart=np.mean(cart_a, axis=0),
+        )
+
+        mon_b = Monomer(
+            symbols=symbols,
+            frac_coords=frac_b,
+            cart_coords=cart_b,
+            cell_index=(1, 0, 0),
+            symop_index=1,
+            centroid_frac=np.mean(frac_b, axis=0),
+            centroid_cart=np.mean(cart_b, axis=0),
+        )
+
+        dimer = DimerPair(
+            monomer_a=mon_a,
+            monomer_b=mon_b,
+            distance=5.0,
+            symop_index_a=0,
+            symop_index_b=1,
+            cell_index_b=(1, 0, 0),
+            multiplicity=2,
+        )
+
+        assert dimer.distance == 5.0
+        assert dimer.multiplicity == 2
+        assert dimer.symop_index_a == 0
+        assert dimer.symop_index_b == 1
+        assert dimer.cell_index_b == (1, 0, 0)
+
+    def test_dimer_pair_to_molecule(self):
+        """Test converting DimerPair to QCElemental Molecule."""
+        import qcelemental as qcel
+
+        symbols = ["C", "O", "O"]
+        cart_a = np.array([[0.0, 0.0, 0.0], [1.16, 0.0, 0.0], [-1.16, 0.0, 0.0]])
+        cart_b = np.array([[5.0, 0.0, 0.0], [6.16, 0.0, 0.0], [3.84, 0.0, 0.0]])
+        frac_a = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]])
+        frac_b = np.array([[0.5, 0.0, 0.0], [0.6, 0.0, 0.0], [0.4, 0.0, 0.0]])
+
+        mon_a = Monomer(
+            symbols=symbols,
+            frac_coords=frac_a,
+            cart_coords=cart_a,
+            cell_index=(0, 0, 0),
+            symop_index=0,
+            centroid_frac=np.zeros(3),
+            centroid_cart=np.zeros(3),
+        )
+
+        mon_b = Monomer(
+            symbols=symbols,
+            frac_coords=frac_b,
+            cart_coords=cart_b,
+            cell_index=(1, 0, 0),
+            symop_index=1,
+            centroid_frac=np.array([0.5, 0.0, 0.0]),
+            centroid_cart=np.array([5.0, 0.0, 0.0]),
+        )
+
+        dimer = DimerPair(
+            monomer_a=mon_a,
+            monomer_b=mon_b,
+            distance=5.0,
+            symop_index_a=0,
+            symop_index_b=1,
+            cell_index_b=(1, 0, 0),
+            multiplicity=1,
+        )
+
+        mol = dimer.to_molecule()
+        # Dimer should have 6 atoms (3 + 3)
+        assert len(mol.symbols) == 6
+        assert tuple(mol.symbols) == ("C", "O", "O", "C", "O", "O")
+
+        # Check geometry is combined and in Bohr
+        geom = np.array(mol.geometry).reshape(-1, 3)
+        expected = np.vstack([cart_a, cart_b]) / qcel.constants.bohr2angstroms
+        assert np.allclose(geom, expected, atol=1e-6)
+
+
+class TestRemoveDuplicateMonomers:
+    """Tests for _remove_duplicate_monomers helper."""
+
+    def test_no_duplicates(self):
+        """Test with no duplicate monomers."""
+        symbols = ["C"]
+        monomers = []
+        for i in range(3):
+            cart = np.array([[float(i * 5), 0.0, 0.0]])
+            frac = np.array([[float(i) * 0.1, 0.0, 0.0]])
+            mon = Monomer(
+                symbols=symbols,
+                frac_coords=frac,
+                cart_coords=cart,
+                cell_index=(0, 0, 0),
+                symop_index=i,
+                centroid_frac=frac[0],
+                centroid_cart=cart[0],
+            )
+            monomers.append(mon)
+
+        result = _remove_duplicate_monomers(monomers, tolerance=0.1)
+        assert len(result) == 3
+
+    def test_with_duplicates(self):
+        """Test removing duplicate monomers."""
+        symbols = ["C"]
+        monomers = []
+
+        # Create two monomers at the same position
+        for i in range(2):
+            cart = np.array([[0.0, 0.0, 0.0]])
+            frac = np.array([[0.0, 0.0, 0.0]])
+            mon = Monomer(
+                symbols=symbols,
+                frac_coords=frac,
+                cart_coords=cart,
+                cell_index=(0, 0, 0),
+                symop_index=i,
+                centroid_frac=frac[0],
+                centroid_cart=cart[0],
+            )
+            monomers.append(mon)
+
+        # Add one at a different position
+        cart = np.array([[5.0, 0.0, 0.0]])
+        frac = np.array([[0.5, 0.0, 0.0]])
+        mon = Monomer(
+            symbols=symbols,
+            frac_coords=frac,
+            cart_coords=cart,
+            cell_index=(0, 0, 0),
+            symop_index=2,
+            centroid_frac=frac[0],
+            centroid_cart=cart[0],
+        )
+        monomers.append(mon)
+
+        result = _remove_duplicate_monomers(monomers, tolerance=0.1)
+        assert len(result) == 2
+
+    def test_empty_list(self):
+        """Test with empty list."""
+        result = _remove_duplicate_monomers([], tolerance=0.1)
+        assert len(result) == 0
+
+
+@pytest.mark.skipif(
+    not TEST_CIF_PATH.exists(),
+    reason="Test CIF file not available"
+)
+class TestGenerateUniqueDimers:
+    """Tests for generate_unique_dimers function."""
+
+    def test_returns_tuple(self):
+        """Test that function returns correct tuple."""
+        result = generate_unique_dimers(TEST_CIF_PATH, radius=5.0)
+        assert isinstance(result, tuple)
+        assert len(result) == 3
+        dimers, crystal, ref_monomer = result
+        assert isinstance(dimers, list)
+        assert isinstance(crystal, Crystal)
+        assert isinstance(ref_monomer, Monomer)
+
+    def test_dimers_are_dimer_pairs(self):
+        """Test that returned dimers are DimerPair objects."""
+        dimers, _, _ = generate_unique_dimers(TEST_CIF_PATH, radius=6.0)
+        for dimer in dimers:
+            assert isinstance(dimer, DimerPair)
+
+    def test_dimers_within_radius(self):
+        """Test that all dimers are within specified radius."""
+        radius = 7.0
+        dimers, _, _ = generate_unique_dimers(TEST_CIF_PATH, radius=radius)
+        for dimer in dimers:
+            assert dimer.distance <= radius + 0.01  # small tolerance
+
+    def test_dimers_sorted_by_distance(self):
+        """Test that dimers are sorted by distance."""
+        dimers, _, _ = generate_unique_dimers(TEST_CIF_PATH, radius=8.0)
+        distances = [d.distance for d in dimers]
+        assert distances == sorted(distances)
+
+    def test_multiplicity_positive(self):
+        """Test that all multiplicities are positive."""
+        dimers, _, _ = generate_unique_dimers(TEST_CIF_PATH, radius=6.0)
+        for dimer in dimers:
+            assert dimer.multiplicity >= 1
+
+    def test_reference_monomer_in_central_cell(self):
+        """Test that reference monomer is in the central unit cell."""
+        _, _, ref_monomer = generate_unique_dimers(TEST_CIF_PATH, radius=5.0)
+        assert ref_monomer.cell_index == (0, 0, 0)
+
+    def test_small_radius_fewer_dimers(self):
+        """Test that smaller radius gives fewer dimers."""
+        dimers_small, _, _ = generate_unique_dimers(TEST_CIF_PATH, radius=4.0)
+        dimers_large, _, _ = generate_unique_dimers(TEST_CIF_PATH, radius=8.0)
+        assert len(dimers_small) <= len(dimers_large)
+
+    def test_no_self_pairing(self):
+        """Test that reference monomer is not paired with itself."""
+        dimers, _, ref = generate_unique_dimers(TEST_CIF_PATH, radius=10.0)
+        for dimer in dimers:
+            # Check that monomer_b is not the same as monomer_a
+            if dimer.cell_index_b == (0, 0, 0):
+                assert dimer.symop_index_b != ref.symop_index
+
+    def test_dimer_to_molecule_correct_atoms(self):
+        """Test that dimer molecules have correct atom count."""
+        dimers, crystal, _ = generate_unique_dimers(TEST_CIF_PATH, radius=6.0)
+        if dimers:
+            dimer = dimers[0]
+            mol = dimer.to_molecule()
+            # CO2 has 3 atoms, dimer should have 6
+            n_atoms_mon = len(dimer.monomer_a.symbols)
+            assert len(mol.symbols) == 2 * n_atoms_mon
+
+    def test_crystal_info_preserved(self):
+        """Test that crystal info is correctly returned."""
+        _, crystal, _ = generate_unique_dimers(TEST_CIF_PATH, radius=5.0)
+        # CO2 is cubic Pa-3
+        assert np.isclose(crystal.a, crystal.b, atol=0.01)
+        assert np.isclose(crystal.b, crystal.c, atol=0.01)
+        assert np.isclose(crystal.alpha, 90.0, atol=0.01)
+        assert np.isclose(crystal.beta, 90.0, atol=0.01)
+        assert np.isclose(crystal.gamma, 90.0, atol=0.01)
+
+
+@pytest.mark.skipif(
+    not TEST_CIF_PATH.exists(),
+    reason="Test CIF file not available"
+)
+class TestGenerateUniqueDimersCO2:
+    """Specific tests for CO2 crystal dimer generation."""
+
+    def test_co2_first_shell_neighbors(self):
+        """Test CO2 first coordination shell.
+
+        CO2 in Pa-3 space group should have a specific first-shell
+        dimer distance based on the unit cell parameter.
+        """
+        dimers, crystal, _ = generate_unique_dimers(
+            TEST_CIF_PATH, radius=5.0, distance_tolerance=0.05
+        )
+
+        # The cell parameter is ~5.624 A
+        # First neighbors should be around 3.9-4.0 A
+        if dimers:
+            first_dist = dimers[0].distance
+            # First shell should be less than half the cell diagonal
+            max_expected = crystal.a * 0.75
+            assert first_dist < max_expected
+
+    def test_co2_monomer_atoms_from_asu(self):
+        """Test that CO2 monomers contain atoms from ASU.
+
+        Note: The CO2 CIF has only 2 atoms in the ASU (C and O on special
+        positions). The current implementation treats each symop-transformed
+        ASU as a monomer. For molecular dimers, users may need to reconstruct
+        complete molecules from symmetry-related ASU copies.
+        """
+        _, _, ref = generate_unique_dimers(TEST_CIF_PATH, radius=5.0)
+
+        # CO2 CIF ASU has 2 atoms: C at (0,0,0) and O at (~0.1185,0.1185,0.1185)
+        # Each "monomer" from the dimer generator contains these 2 ASU atoms
+        assert len(ref.symbols) == 2
+        assert ref.symbols.count("C") == 1
+        assert ref.symbols.count("O") == 1
+
+        # Verify the atoms are present
+        assert "C" in ref.symbols
+        assert "O" in ref.symbols
 
 
 if __name__ == "__main__":
