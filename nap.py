@@ -10,7 +10,7 @@ from space_groups import generate_molecular_dimers
 
 # Path to CIF file
 TEST_CIF_PATH = Path(
-    "/home/awallace43/projects/x23_dmetcalf_2022_si/cifs/carbon_dioxide.cif"
+    "/home/awallace43/projects/x23_dmetcalf_2022_si/cifs/hexamine.cif"
 )
 
 # Generate unique molecular dimers
