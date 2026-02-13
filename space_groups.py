@@ -1249,6 +1249,561 @@ class DimerPair:
         )
 
 
+@dataclass
+class MolecularCluster:
+    """
+    Represents a complete molecule identified by connectivity analysis.
+
+    Attributes
+    ----------
+    symbols : List[str]
+        Atom symbols in the molecule.
+    frac_coords : NDArray[np.float64]
+        Fractional coordinates of atoms, shape (N, 3).
+    cart_coords : NDArray[np.float64]
+        Cartesian coordinates of atoms, shape (N, 3).
+    centroid_frac : NDArray[np.float64]
+        Centroid in fractional coordinates.
+    centroid_cart : NDArray[np.float64]
+        Centroid in Cartesian coordinates (Angstroms).
+    molecule_index : int
+        Index identifying this molecule in the unit cell.
+    cell_index : Tuple[int, int, int]
+        Unit cell translation from reference cell.
+    """
+
+    symbols: List[str]
+    frac_coords: NDArray[np.float64]
+    cart_coords: NDArray[np.float64]
+    centroid_frac: NDArray[np.float64]
+    centroid_cart: NDArray[np.float64]
+    molecule_index: int
+    cell_index: Tuple[int, int, int] = (0, 0, 0)
+
+    def to_molecule(self) -> qcel.models.Molecule:
+        """Convert to QCElemental Molecule object."""
+        cart_bohr = self.cart_coords / qcel.constants.bohr2angstroms
+        return qcel.models.Molecule(
+            symbols=self.symbols,
+            geometry=cart_bohr.flatten(),
+        )
+
+
+@dataclass
+class MolecularDimer:
+    """
+    Represents a dimer of two complete molecules.
+
+    Attributes
+    ----------
+    molecule_a : MolecularCluster
+        The reference molecule.
+    molecule_b : MolecularCluster
+        The partner molecule.
+    distance : float
+        Center-to-center distance in Angstroms.
+    multiplicity : int
+        Number of symmetry-equivalent copies of this dimer type.
+    """
+
+    molecule_a: MolecularCluster
+    molecule_b: MolecularCluster
+    distance: float
+    multiplicity: int = 1
+
+    def to_molecule(self) -> qcel.models.Molecule:
+        """Convert dimer to QCElemental Molecule object."""
+        symbols = list(self.molecule_a.symbols) + list(self.molecule_b.symbols)
+        coords = np.vstack([self.molecule_a.cart_coords,
+                           self.molecule_b.cart_coords])
+        cart_bohr = coords / qcel.constants.bohr2angstroms
+        return qcel.models.Molecule(
+            symbols=symbols,
+            geometry=cart_bohr.flatten(),
+        )
+
+    def to_molecules(self) -> Tuple[qcel.models.Molecule, qcel.models.Molecule]:
+        """Return the two monomers as separate QCElemental Molecules."""
+        return self.molecule_a.to_molecule(), self.molecule_b.to_molecule()
+
+
+def _get_covalent_radius(symbol: str) -> float:
+    """
+    Get covalent radius for an element in Angstroms.
+
+    Parameters
+    ----------
+    symbol : str
+        Element symbol.
+
+    Returns
+    -------
+    float
+        Covalent radius in Angstroms.
+    """
+    # qcelemental returns covalent radii in Bohr
+    radius_bohr = qcel.covalentradii.get(symbol)
+    return radius_bohr * qcel.constants.bohr2angstroms
+
+
+def _build_bond_graph(
+    symbols: List[str],
+    cart_coords: NDArray[np.float64],
+    bond_tolerance: float = 0.4,
+) -> List[List[int]]:
+    """
+    Build adjacency list for atoms based on covalent bonding.
+
+    Two atoms are considered bonded if their distance is less than
+    the sum of their covalent radii plus a tolerance.
+
+    Parameters
+    ----------
+    symbols : List[str]
+        Atom symbols.
+    cart_coords : NDArray[np.float64]
+        Cartesian coordinates, shape (N, 3).
+    bond_tolerance : float, default=0.4
+        Tolerance in Angstroms added to sum of covalent radii.
+
+    Returns
+    -------
+    List[List[int]]
+        Adjacency list where adj[i] contains indices of atoms bonded to atom i.
+    """
+    n_atoms = len(symbols)
+    adj = [[] for _ in range(n_atoms)]
+
+    # Get covalent radii
+    radii = [_get_covalent_radius(s) for s in symbols]
+
+    for i in range(n_atoms):
+        for j in range(i + 1, n_atoms):
+            dist = np.linalg.norm(cart_coords[i] - cart_coords[j])
+            max_bond = radii[i] + radii[j] + bond_tolerance
+            if dist < max_bond:
+                adj[i].append(j)
+                adj[j].append(i)
+
+    return adj
+
+
+def _find_connected_components(adj: List[List[int]]) -> List[List[int]]:
+    """
+    Find connected components in a graph using BFS.
+
+    Parameters
+    ----------
+    adj : List[List[int]]
+        Adjacency list representation of the graph.
+
+    Returns
+    -------
+    List[List[int]]
+        List of components, where each component is a list of atom indices.
+    """
+    n = len(adj)
+    visited = [False] * n
+    components = []
+
+    for start in range(n):
+        if visited[start]:
+            continue
+
+        # BFS from this node
+        component = []
+        queue = [start]
+        visited[start] = True
+
+        while queue:
+            node = queue.pop(0)
+            component.append(node)
+            for neighbor in adj[node]:
+                if not visited[neighbor]:
+                    visited[neighbor] = True
+                    queue.append(neighbor)
+
+        components.append(sorted(component))
+
+    return components
+
+
+def _identify_molecules_in_cell(
+    crystal: Crystal,
+    asu_symbols: List[str],
+    asu_frac_coords: List[NDArray[np.float64]],
+    bond_tolerance: float = 0.4,
+) -> List[MolecularCluster]:
+    """
+    Identify complete molecules in the unit cell using connectivity.
+
+    This function:
+    1. Generates all symmetry-equivalent atoms in a 3x3x3 supercell
+    2. Builds a bond graph based on covalent radii
+    3. Finds connected components (molecules)
+    4. Returns molecules whose centroids are in the central unit cell
+
+    Parameters
+    ----------
+    crystal : Crystal
+        Crystal object with symmetry operations.
+    asu_symbols : List[str]
+        Atom symbols in the asymmetric unit.
+    asu_frac_coords : List[NDArray[np.float64]]
+        Fractional coordinates of ASU atoms.
+    bond_tolerance : float, default=0.4
+        Tolerance for bond detection in Angstroms.
+
+    Returns
+    -------
+    List[MolecularCluster]
+        Complete molecules with centroids in the central unit cell.
+    """
+    # Generate atoms in a 3x3x3 supercell to capture molecules
+    # that cross unit cell boundaries
+    all_symbols = []
+    all_frac = []
+    all_cart = []
+
+    for di in range(-1, 2):
+        for dj in range(-1, 2):
+            for dk in range(-1, 2):
+                translation = np.array([float(di), float(dj), float(dk)])
+                for symop in crystal.symops:
+                    for sym, frac in zip(asu_symbols, asu_frac_coords):
+                        new_frac = symop.apply(frac) + translation
+                        new_cart = crystal.to_cartesian(new_frac)
+                        all_symbols.append(sym)
+                        all_frac.append(new_frac)
+                        all_cart.append(new_cart)
+
+    all_frac = np.array(all_frac)
+    all_cart = np.array(all_cart)
+
+    # Remove duplicate atoms (same position)
+    unique_indices = []
+    for i in range(len(all_symbols)):
+        is_dup = False
+        for j in unique_indices:
+            if np.linalg.norm(all_cart[i] - all_cart[j]) < 0.01:
+                is_dup = True
+                break
+        if not is_dup:
+            unique_indices.append(i)
+
+    symbols = [all_symbols[i] for i in unique_indices]
+    frac_coords = all_frac[unique_indices]
+    cart_coords = all_cart[unique_indices]
+
+    # Build bond graph and find molecules
+    adj = _build_bond_graph(symbols, cart_coords, bond_tolerance)
+    components = _find_connected_components(adj)
+
+    # Create MolecularCluster objects for molecules in the central cell
+    molecules = []
+    mol_idx = 0
+
+    for component in components:
+        mol_symbols = [symbols[i] for i in component]
+        mol_frac = frac_coords[component]
+        mol_cart = cart_coords[component]
+        centroid_frac = np.mean(mol_frac, axis=0)
+        centroid_cart = np.mean(mol_cart, axis=0)
+
+        # Check if centroid is in the central unit cell [0, 1)
+        if (0 <= centroid_frac[0] < 1 and
+            0 <= centroid_frac[1] < 1 and
+            0 <= centroid_frac[2] < 1):
+
+            mol = MolecularCluster(
+                symbols=mol_symbols,
+                frac_coords=mol_frac,
+                cart_coords=mol_cart,
+                centroid_frac=centroid_frac,
+                centroid_cart=centroid_cart,
+                molecule_index=mol_idx,
+                cell_index=(0, 0, 0),
+            )
+            molecules.append(mol)
+            mol_idx += 1
+
+    return molecules
+
+
+def generate_molecular_dimers(
+    filepath: str | Path,
+    radius: float,
+    bond_tolerance: float = 0.4,
+    distance_tolerance: float = 0.01,
+) -> Tuple[List[MolecularDimer], Crystal, List[MolecularCluster]]:
+    """
+    Generate symmetry-unique molecular dimers within a spherical radius.
+
+    This function identifies complete molecules using connectivity analysis
+    (based on covalent radii), then generates all unique dimer pairings.
+    This is the recommended function for obtaining valid QCElemental
+    dimer molecules.
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Path to the CIF file.
+    radius : float
+        Maximum center-to-center distance in Angstroms for dimer pairs.
+    bond_tolerance : float, default=0.4
+        Tolerance in Angstroms for bond detection (added to sum of
+        covalent radii).
+    distance_tolerance : float, default=0.01
+        Tolerance in Angstroms for considering distances as equivalent
+        when identifying unique dimers.
+
+    Returns
+    -------
+    Tuple[List[MolecularDimer], Crystal, List[MolecularCluster]]
+        - List of unique MolecularDimer objects, sorted by distance
+        - Crystal object with unit cell information
+        - List of reference molecules in the central unit cell
+
+    Examples
+    --------
+    >>> dimers, crystal, mols = generate_molecular_dimers("co2.cif", 10.0)
+    >>> for d in dimers:
+    ...     print(f"Distance: {d.distance:.2f} A, mult: {d.multiplicity}")
+    ...     qcel_mol = d.to_molecule()  # Valid QCElemental dimer molecule
+
+    Notes
+    -----
+    Unlike generate_unique_dimers() which uses ASU fragments, this function
+    reconstructs complete molecules by analyzing covalent connectivity.
+    This ensures that each monomer in the dimer is a chemically valid
+    molecule.
+    """
+    crystal, asu_symbols, asu_frac_coords = parse_cif_file(filepath)
+
+    # Identify complete molecules in the central unit cell
+    central_molecules = _identify_molecules_in_cell(
+        crystal, asu_symbols, asu_frac_coords, bond_tolerance
+    )
+
+    if not central_molecules:
+        return [], crystal, []
+
+    # Use the first molecule as the reference
+    ref_molecule = central_molecules[0]
+    ref_centroid = ref_molecule.centroid_cart
+
+    # Calculate range of unit cells to search
+    n_a = int(np.ceil(radius / crystal.a)) + 1
+    n_b = int(np.ceil(radius / crystal.b)) + 1
+    n_c = int(np.ceil(radius / crystal.c)) + 1
+
+    # Generate candidate dimers by translating molecules to neighboring cells
+    candidate_dimers = []
+
+    for i in range(-n_a, n_a + 1):
+        for j in range(-n_b, n_b + 1):
+            for k in range(-n_c, n_c + 1):
+                cell_idx = (i, j, k)
+                translation = np.array([float(i), float(j), float(k)])
+
+                for mol in central_molecules:
+                    # Skip self-pairing (same molecule in same cell)
+                    is_ref = (cell_idx == (0, 0, 0) and
+                              mol.molecule_index == ref_molecule.molecule_index)
+                    if is_ref:
+                        continue
+
+                    # Translate molecule
+                    trans_frac = mol.frac_coords + translation
+                    trans_cart = crystal.to_cartesian(trans_frac)
+                    trans_centroid = np.mean(trans_cart, axis=0)
+
+                    # Check distance
+                    dist = np.linalg.norm(trans_centroid - ref_centroid)
+                    if dist > radius:
+                        continue
+
+                    partner = MolecularCluster(
+                        symbols=mol.symbols,
+                        frac_coords=trans_frac,
+                        cart_coords=trans_cart,
+                        centroid_frac=np.mean(trans_frac, axis=0),
+                        centroid_cart=trans_centroid,
+                        molecule_index=mol.molecule_index,
+                        cell_index=cell_idx,
+                    )
+
+                    dimer = MolecularDimer(
+                        molecule_a=ref_molecule,
+                        molecule_b=partner,
+                        distance=dist,
+                        multiplicity=1,
+                    )
+                    candidate_dimers.append(dimer)
+
+    # Identify unique dimers based on distance
+    unique_dimers = _identify_unique_molecular_dimers(
+        candidate_dimers, crystal, distance_tolerance
+    )
+
+    # Sort by distance
+    unique_dimers.sort(key=lambda d: d.distance)
+
+    return unique_dimers, crystal, central_molecules
+
+
+def _identify_unique_molecular_dimers(
+    dimers: List[MolecularDimer],
+    crystal: Crystal,
+    tolerance: float = 0.01,
+) -> List[MolecularDimer]:
+    """
+    Identify symmetry-unique molecular dimers from a list of candidates.
+
+    Parameters
+    ----------
+    dimers : List[MolecularDimer]
+        Candidate dimers.
+    crystal : Crystal
+        Crystal object for symmetry operations.
+    tolerance : float, default=0.01
+        Distance tolerance in Angstroms.
+
+    Returns
+    -------
+    List[MolecularDimer]
+        Unique dimers with multiplicity set.
+    """
+    if not dimers:
+        return []
+
+    dimers_sorted = sorted(dimers, key=lambda d: d.distance)
+
+    unique = []
+    used = [False] * len(dimers_sorted)
+
+    for i, dimer_i in enumerate(dimers_sorted):
+        if used[i]:
+            continue
+
+        multiplicity = 1
+        used[i] = True
+
+        # Find equivalent dimers
+        for j in range(i + 1, len(dimers_sorted)):
+            if used[j]:
+                continue
+
+            dimer_j = dimers_sorted[j]
+
+            # Check if distances match
+            if abs(dimer_i.distance - dimer_j.distance) > tolerance:
+                if dimer_j.distance > dimer_i.distance + tolerance:
+                    break
+                continue
+
+            # Check if geometry is equivalent
+            if _are_molecular_dimers_equivalent(
+                dimer_i, dimer_j, crystal, tolerance
+            ):
+                multiplicity += 1
+                used[j] = True
+
+        unique_dimer = MolecularDimer(
+            molecule_a=dimer_i.molecule_a,
+            molecule_b=dimer_i.molecule_b,
+            distance=dimer_i.distance,
+            multiplicity=multiplicity,
+        )
+        unique.append(unique_dimer)
+
+    return unique
+
+
+def _are_molecular_dimers_equivalent(
+    dimer1: MolecularDimer,
+    dimer2: MolecularDimer,
+    crystal: Crystal,
+    tolerance: float = 0.01,
+) -> bool:
+    """
+    Check if two molecular dimers are symmetry-equivalent.
+
+    Parameters
+    ----------
+    dimer1, dimer2 : MolecularDimer
+        Dimers to compare.
+    crystal : Crystal
+        Crystal object with symmetry operations.
+    tolerance : float
+        Distance tolerance in Angstroms.
+
+    Returns
+    -------
+    bool
+        True if dimers are equivalent.
+    """
+    if abs(dimer1.distance - dimer2.distance) > tolerance:
+        return False
+
+    # Compare relative vectors between centroids
+    vec1 = dimer1.molecule_b.centroid_cart - dimer1.molecule_a.centroid_cart
+    vec2 = dimer2.molecule_b.centroid_cart - dimer2.molecule_a.centroid_cart
+
+    # Check if vectors are related by a point group operation
+    for symop in crystal.symops:
+        rot_vec = crystal.to_cartesian(
+            symop.rot @ crystal.to_fractional(vec1)
+        )
+        if np.allclose(rot_vec, vec2, atol=tolerance):
+            return True
+        if np.allclose(rot_vec, -vec2, atol=tolerance):
+            return True
+
+    return False
+
+
+def get_dimer_molecules(
+    filepath: str | Path,
+    radius: float,
+    bond_tolerance: float = 0.4,
+    distance_tolerance: float = 0.01,
+) -> List[qcel.models.Molecule]:
+    """
+    Convenience function to get a list of QCElemental dimer molecules.
+
+    This is the simplest interface for obtaining valid molecular dimers
+    from a CIF file.
+
+    Parameters
+    ----------
+    filepath : str or Path
+        Path to the CIF file.
+    radius : float
+        Maximum center-to-center distance in Angstroms for dimer pairs.
+    bond_tolerance : float, default=0.4
+        Tolerance for bond detection.
+    distance_tolerance : float, default=0.01
+        Tolerance for distance equivalence.
+
+    Returns
+    -------
+    List[qcel.models.Molecule]
+        List of QCElemental Molecule objects, one for each unique dimer,
+        sorted by center-to-center distance.
+
+    Examples
+    --------
+    >>> dimers = get_dimer_molecules("crystal.cif", radius=10.0)
+    >>> for mol in dimers:
+    ...     print(f"Atoms: {len(mol.symbols)}, Formula: {mol.get_molecular_formula()}")
+    """
+    dimers, _, _ = generate_molecular_dimers(
+        filepath, radius, bond_tolerance, distance_tolerance
+    )
+    return [d.to_molecule() for d in dimers]
+
+
 def generate_unique_dimers(
     filepath: str | Path,
     radius: float,

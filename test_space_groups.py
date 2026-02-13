@@ -14,14 +14,21 @@ from space_groups import (
     Crystal,
     Monomer,
     DimerPair,
+    MolecularCluster,
+    MolecularDimer,
     parse_symop_xyz,
     parse_cif_file,
     cif_to_molecule,
     get_crystal_info,
     remove_duplicate_atoms,
     generate_unique_dimers,
+    generate_molecular_dimers,
+    get_dimer_molecules,
     _parse_fraction,
     _remove_duplicate_monomers,
+    _build_bond_graph,
+    _find_connected_components,
+    _identify_molecules_in_cell,
 )
 
 
@@ -764,6 +771,376 @@ class TestGenerateUniqueDimersCO2:
         # Verify the atoms are present
         assert "C" in ref.symbols
         assert "O" in ref.symbols
+
+
+# =============================================================================
+# Tests for Molecular Dimer Generation (complete molecules via connectivity)
+# =============================================================================
+
+class TestBuildBondGraph:
+    """Tests for _build_bond_graph function."""
+
+    def test_co2_bonds(self):
+        """Test bond detection for CO2 molecule."""
+        symbols = ["C", "O", "O"]
+        # CO2 with C-O bond length ~1.16 A
+        coords = np.array([
+            [0.0, 0.0, 0.0],      # C
+            [1.16, 0.0, 0.0],     # O
+            [-1.16, 0.0, 0.0],    # O
+        ])
+        adj = _build_bond_graph(symbols, coords, bond_tolerance=0.4)
+
+        # C should be bonded to both O atoms
+        assert 1 in adj[0]
+        assert 2 in adj[0]
+        # O atoms bonded to C
+        assert 0 in adj[1]
+        assert 0 in adj[2]
+        # O atoms not bonded to each other
+        assert 2 not in adj[1]
+        assert 1 not in adj[2]
+
+    def test_two_separate_molecules(self):
+        """Test that distant molecules are not bonded."""
+        symbols = ["C", "O", "O", "C", "O", "O"]
+        coords = np.array([
+            [0.0, 0.0, 0.0],      # C
+            [1.16, 0.0, 0.0],     # O
+            [-1.16, 0.0, 0.0],    # O
+            [10.0, 0.0, 0.0],     # C (second molecule)
+            [11.16, 0.0, 0.0],    # O
+            [8.84, 0.0, 0.0],     # O
+        ])
+        adj = _build_bond_graph(symbols, coords, bond_tolerance=0.4)
+
+        # First CO2
+        assert 1 in adj[0] and 2 in adj[0]
+        # Second CO2
+        assert 4 in adj[3] and 5 in adj[3]
+        # No cross-molecule bonds
+        assert 3 not in adj[0]
+        assert 0 not in adj[3]
+
+
+class TestFindConnectedComponents:
+    """Tests for _find_connected_components function."""
+
+    def test_single_molecule(self):
+        """Test finding a single connected molecule."""
+        adj = [[1, 2], [0], [0]]  # C bonded to two O's
+        components = _find_connected_components(adj)
+        assert len(components) == 1
+        assert sorted(components[0]) == [0, 1, 2]
+
+    def test_two_molecules(self):
+        """Test finding two separate molecules."""
+        # Two separate CO2 molecules
+        adj = [[1, 2], [0], [0], [4, 5], [3], [3]]
+        components = _find_connected_components(adj)
+        assert len(components) == 2
+        assert sorted(components[0]) == [0, 1, 2]
+        assert sorted(components[1]) == [3, 4, 5]
+
+    def test_isolated_atoms(self):
+        """Test with isolated atoms (no bonds)."""
+        adj = [[], [], []]
+        components = _find_connected_components(adj)
+        assert len(components) == 3
+
+
+class TestMolecularCluster:
+    """Tests for MolecularCluster dataclass."""
+
+    def test_creation(self):
+        """Test creating a MolecularCluster."""
+        symbols = ["C", "O", "O"]
+        frac = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]])
+        cart = np.array([[0.0, 0.0, 0.0], [1.16, 0.0, 0.0], [-1.16, 0.0, 0.0]])
+
+        mol = MolecularCluster(
+            symbols=symbols,
+            frac_coords=frac,
+            cart_coords=cart,
+            centroid_frac=np.mean(frac, axis=0),
+            centroid_cart=np.mean(cart, axis=0),
+            molecule_index=0,
+            cell_index=(0, 0, 0),
+        )
+
+        assert mol.symbols == ["C", "O", "O"]
+        assert mol.molecule_index == 0
+        assert mol.cell_index == (0, 0, 0)
+
+    def test_to_molecule(self):
+        """Test converting to QCElemental Molecule."""
+        symbols = ["C", "O", "O"]
+        cart = np.array([[0.0, 0.0, 0.0], [1.16, 0.0, 0.0], [-1.16, 0.0, 0.0]])
+        frac = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]])
+
+        mol_cluster = MolecularCluster(
+            symbols=symbols,
+            frac_coords=frac,
+            cart_coords=cart,
+            centroid_frac=np.zeros(3),
+            centroid_cart=np.zeros(3),
+            molecule_index=0,
+        )
+
+        qcel_mol = mol_cluster.to_molecule()
+        assert tuple(qcel_mol.symbols) == ("C", "O", "O")
+
+
+class TestMolecularDimer:
+    """Tests for MolecularDimer dataclass."""
+
+    def test_creation(self):
+        """Test creating a MolecularDimer."""
+        symbols = ["C", "O", "O"]
+        cart_a = np.array([[0.0, 0.0, 0.0], [1.16, 0.0, 0.0], [-1.16, 0.0, 0.0]])
+        cart_b = np.array([[5.0, 0.0, 0.0], [6.16, 0.0, 0.0], [3.84, 0.0, 0.0]])
+        frac = np.zeros((3, 3))
+
+        mol_a = MolecularCluster(
+            symbols=symbols,
+            frac_coords=frac,
+            cart_coords=cart_a,
+            centroid_frac=np.zeros(3),
+            centroid_cart=np.zeros(3),
+            molecule_index=0,
+        )
+        mol_b = MolecularCluster(
+            symbols=symbols,
+            frac_coords=frac,
+            cart_coords=cart_b,
+            centroid_frac=np.array([0.5, 0, 0]),
+            centroid_cart=np.array([5.0, 0, 0]),
+            molecule_index=1,
+        )
+
+        dimer = MolecularDimer(
+            molecule_a=mol_a,
+            molecule_b=mol_b,
+            distance=5.0,
+            multiplicity=2,
+        )
+
+        assert dimer.distance == 5.0
+        assert dimer.multiplicity == 2
+
+    def test_to_molecule(self):
+        """Test converting MolecularDimer to QCElemental Molecule."""
+        symbols = ["C", "O", "O"]
+        cart_a = np.array([[0.0, 0.0, 0.0], [1.16, 0.0, 0.0], [-1.16, 0.0, 0.0]])
+        cart_b = np.array([[5.0, 0.0, 0.0], [6.16, 0.0, 0.0], [3.84, 0.0, 0.0]])
+        frac = np.zeros((3, 3))
+
+        mol_a = MolecularCluster(
+            symbols=symbols, frac_coords=frac, cart_coords=cart_a,
+            centroid_frac=np.zeros(3), centroid_cart=np.zeros(3),
+            molecule_index=0,
+        )
+        mol_b = MolecularCluster(
+            symbols=symbols, frac_coords=frac, cart_coords=cart_b,
+            centroid_frac=np.array([0.5, 0, 0]),
+            centroid_cart=np.array([5.0, 0, 0]),
+            molecule_index=1,
+        )
+
+        dimer = MolecularDimer(
+            molecule_a=mol_a, molecule_b=mol_b,
+            distance=5.0, multiplicity=1,
+        )
+
+        qcel_mol = dimer.to_molecule()
+        assert len(qcel_mol.symbols) == 6
+        assert tuple(qcel_mol.symbols) == ("C", "O", "O", "C", "O", "O")
+
+    def test_to_molecules(self):
+        """Test getting separate monomer molecules."""
+        symbols = ["C", "O", "O"]
+        cart_a = np.array([[0.0, 0.0, 0.0], [1.16, 0.0, 0.0], [-1.16, 0.0, 0.0]])
+        cart_b = np.array([[5.0, 0.0, 0.0], [6.16, 0.0, 0.0], [3.84, 0.0, 0.0]])
+        frac = np.zeros((3, 3))
+
+        mol_a = MolecularCluster(
+            symbols=symbols, frac_coords=frac, cart_coords=cart_a,
+            centroid_frac=np.zeros(3), centroid_cart=np.zeros(3),
+            molecule_index=0,
+        )
+        mol_b = MolecularCluster(
+            symbols=symbols, frac_coords=frac, cart_coords=cart_b,
+            centroid_frac=np.array([0.5, 0, 0]),
+            centroid_cart=np.array([5.0, 0, 0]),
+            molecule_index=1,
+        )
+
+        dimer = MolecularDimer(
+            molecule_a=mol_a, molecule_b=mol_b,
+            distance=5.0, multiplicity=1,
+        )
+
+        mon_a, mon_b = dimer.to_molecules()
+        assert len(mon_a.symbols) == 3
+        assert len(mon_b.symbols) == 3
+
+
+@pytest.mark.skipif(
+    not TEST_CIF_PATH.exists(),
+    reason="Test CIF file not available"
+)
+class TestIdentifyMoleculesInCell:
+    """Tests for _identify_molecules_in_cell function."""
+
+    def test_co2_molecules_count(self):
+        """Test that correct number of CO2 molecules are found."""
+        crystal, symbols, frac = parse_cif_file(TEST_CIF_PATH)
+        molecules = _identify_molecules_in_cell(crystal, symbols, frac)
+
+        # Pa-3 space group with Z=4 should have 4 CO2 molecules per cell
+        assert len(molecules) == 4
+
+    def test_co2_molecule_composition(self):
+        """Test that each CO2 molecule has correct composition."""
+        crystal, symbols, frac = parse_cif_file(TEST_CIF_PATH)
+        molecules = _identify_molecules_in_cell(crystal, symbols, frac)
+
+        for mol in molecules:
+            assert len(mol.symbols) == 3
+            assert mol.symbols.count("C") == 1
+            assert mol.symbols.count("O") == 2
+
+    def test_co2_molecules_are_linear(self):
+        """Test that identified CO2 molecules are linear."""
+        crystal, symbols, frac = parse_cif_file(TEST_CIF_PATH)
+        molecules = _identify_molecules_in_cell(crystal, symbols, frac)
+
+        for mol in molecules:
+            coords = mol.cart_coords
+            c_idx = mol.symbols.index("C")
+            o_indices = [i for i, s in enumerate(mol.symbols) if s == "O"]
+
+            c_pos = coords[c_idx]
+            o1_pos = coords[o_indices[0]]
+            o2_pos = coords[o_indices[1]]
+
+            # Vectors from C to each O
+            v1 = o1_pos - c_pos
+            v2 = o2_pos - c_pos
+
+            # For linear molecule, should be antiparallel (cos = -1)
+            cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+            assert np.isclose(cos_angle, -1.0, atol=0.01)
+
+
+@pytest.mark.skipif(
+    not TEST_CIF_PATH.exists(),
+    reason="Test CIF file not available"
+)
+class TestGenerateMolecularDimers:
+    """Tests for generate_molecular_dimers function."""
+
+    def test_returns_tuple(self):
+        """Test that function returns correct tuple."""
+        result = generate_molecular_dimers(TEST_CIF_PATH, radius=5.0)
+        assert isinstance(result, tuple)
+        assert len(result) == 3
+        dimers, crystal, molecules = result
+        assert isinstance(dimers, list)
+        assert isinstance(crystal, Crystal)
+        assert isinstance(molecules, list)
+
+    def test_dimers_are_molecular_dimers(self):
+        """Test that returned dimers are MolecularDimer objects."""
+        dimers, _, _ = generate_molecular_dimers(TEST_CIF_PATH, radius=6.0)
+        for dimer in dimers:
+            assert isinstance(dimer, MolecularDimer)
+
+    def test_molecules_are_complete(self):
+        """Test that molecules in dimers are complete (3 atoms for CO2)."""
+        dimers, _, _ = generate_molecular_dimers(TEST_CIF_PATH, radius=6.0)
+        for dimer in dimers:
+            assert len(dimer.molecule_a.symbols) == 3
+            assert len(dimer.molecule_b.symbols) == 3
+
+    def test_dimer_has_six_atoms(self):
+        """Test that CO2 dimers have 6 atoms total."""
+        dimers, _, _ = generate_molecular_dimers(TEST_CIF_PATH, radius=6.0)
+        for dimer in dimers:
+            qcel_mol = dimer.to_molecule()
+            assert len(qcel_mol.symbols) == 6
+
+    def test_dimers_within_radius(self):
+        """Test that all dimers are within specified radius."""
+        radius = 7.0
+        dimers, _, _ = generate_molecular_dimers(TEST_CIF_PATH, radius=radius)
+        for dimer in dimers:
+            assert dimer.distance <= radius + 0.01
+
+    def test_dimers_sorted_by_distance(self):
+        """Test that dimers are sorted by distance."""
+        dimers, _, _ = generate_molecular_dimers(TEST_CIF_PATH, radius=8.0)
+        distances = [d.distance for d in dimers]
+        assert distances == sorted(distances)
+
+    def test_multiplicity_positive(self):
+        """Test that all multiplicities are positive."""
+        dimers, _, _ = generate_molecular_dimers(TEST_CIF_PATH, radius=6.0)
+        for dimer in dimers:
+            assert dimer.multiplicity >= 1
+
+    def test_co2_first_neighbor_distance(self):
+        """Test CO2 first neighbor distance is reasonable."""
+        dimers, crystal, _ = generate_molecular_dimers(
+            TEST_CIF_PATH, radius=5.0
+        )
+        if dimers:
+            # First neighbor should be around 3.9-4.0 A for CO2
+            assert 3.5 < dimers[0].distance < 4.5
+
+    def test_co2_first_shell_multiplicity(self):
+        """Test CO2 first shell has expected multiplicity.
+
+        In Pa-3 with Z=4, each CO2 has 12 nearest neighbors.
+        """
+        dimers, _, _ = generate_molecular_dimers(TEST_CIF_PATH, radius=5.0)
+        if dimers:
+            # First shell should have multiplicity 12
+            assert dimers[0].multiplicity == 12
+
+
+@pytest.mark.skipif(
+    not TEST_CIF_PATH.exists(),
+    reason="Test CIF file not available"
+)
+class TestGetDimerMolecules:
+    """Tests for get_dimer_molecules convenience function."""
+
+    def test_returns_list(self):
+        """Test that function returns a list."""
+        result = get_dimer_molecules(TEST_CIF_PATH, radius=6.0)
+        assert isinstance(result, list)
+
+    def test_returns_qcel_molecules(self):
+        """Test that list contains QCElemental Molecule objects."""
+        import qcelemental as qcel
+        dimers = get_dimer_molecules(TEST_CIF_PATH, radius=6.0)
+        for mol in dimers:
+            assert isinstance(mol, qcel.models.Molecule)
+
+    def test_molecules_have_six_atoms(self):
+        """Test that all dimer molecules have 6 atoms (2 x CO2)."""
+        dimers = get_dimer_molecules(TEST_CIF_PATH, radius=6.0)
+        for mol in dimers:
+            assert len(mol.symbols) == 6
+
+    def test_molecules_have_correct_formula(self):
+        """Test that dimers have correct atomic composition."""
+        dimers = get_dimer_molecules(TEST_CIF_PATH, radius=6.0)
+        for mol in dimers:
+            symbols = list(mol.symbols)
+            assert symbols.count("C") == 2
+            assert symbols.count("O") == 4
 
 
 if __name__ == "__main__":
